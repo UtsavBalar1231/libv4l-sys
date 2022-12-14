@@ -80,8 +80,8 @@ fn main() {
     let fmt = unsafe {
         let mut fmt: v4l::v4l2_format = mem::zeroed();
         fmt.type_ = v4l::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        fmt.fmt.pix.width = 320;
-        fmt.fmt.pix.height = 240;
+        fmt.fmt.pix.width = 640;
+        fmt.fmt.pix.height = 480;
         fmt.fmt.pix.pixelformat = v4l::pixel_format::V4L2_PIX_FMT_RGB24;
         fmt.fmt.pix.field = v4l::v4l2_field_V4L2_FIELD_INTERLACED;
 
@@ -176,75 +176,129 @@ fn main() {
         &mut type_ as *mut _ as *mut libc::c_void,
     );
 
-    for i in 0..20 {
-        debug!("0..20: {}", i);
-
-        unsafe {
-            let mut fds: libc::fd_set = mem::zeroed();
-            loop {
-                libc::FD_ZERO(&mut fds);
-                libc::FD_SET(fd, &mut fds);
-                let mut tv = libc::timeval {
-                    tv_sec: 2,
-                    tv_usec: 0,
-                };
-                let r = libc::select(fd + 1, &mut fds, ptr::null_mut(), ptr::null_mut(), &mut tv);
-                if !(r == -1 && (errno!() == libc::EINTR)) {
-                    if cfg!(target_os = "linux") {
-                        debug!("time left: {}.{:06}", tv.tv_sec, tv.tv_usec);
-                    }
-                    break;
+    unsafe {
+        let mut fds: libc::fd_set = mem::zeroed();
+        loop {
+            libc::FD_ZERO(&mut fds);
+            libc::FD_SET(fd, &mut fds);
+            let mut tv = libc::timeval {
+                tv_sec: 2,
+                tv_usec: 0,
+            };
+            let r = libc::select(fd + 1, &mut fds, ptr::null_mut(), ptr::null_mut(), &mut tv);
+            if !(r == -1 && (errno!() == libc::EINTR)) {
+                if cfg!(target_os = "linux") {
+                    // debug!("time left: {}.{:06}", tv.tv_sec, tv.tv_usec);
                 }
-                if r == -1 {
-                    error!("select error {}, {}", errno!(), strerror());
-                    panic!()
-                }
+                break;
+            }
+            if r == -1 {
+                error!("select error {}, {}", errno!(), strerror());
+                panic!()
             }
         }
-
-        let mut buf = unsafe {
-            let mut buf: v4l::v4l2_buffer = mem::zeroed();
-            buf.type_ = v4l::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = v4l::v4l2_memory_V4L2_MEMORY_MMAP;
-            buf
-        };
-
-        debug!("VIDIOC_DQBUF");
-        xioctl(
-            fd,
-            v4l::codes::VIDIOC_DQBUF,
-            &mut buf as *mut _ as *mut libc::c_void,
-        );
-
-        {
-            let mut fout = fs::File::create(&format!("out{:03}.ppm", i)).unwrap();
-            write!(
-                fout,
-                "P6\n{} {} 255\n",
-                unsafe { fmt.fmt.pix.width },
-                unsafe { fmt.fmt.pix.height }
-            )
-            .unwrap();
-
-            unsafe {
-                fout.write_all(slice::from_raw_parts(
-                    buffers[buf.index as usize].start as *const u8,
-                    buf.bytesused as usize,
-                ))
-                .unwrap();
-            }
-        }
-
-        debug!("VIDIOC_QBUF");
-        xioctl(
-            fd,
-            v4l::codes::VIDIOC_QBUF,
-            &mut buf as *mut _ as *mut libc::c_void,
-        );
     }
 
+    let mut buf = unsafe {
+        let mut buf: v4l::v4l2_buffer = mem::zeroed();
+        buf.type_ = v4l::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = v4l::v4l2_memory_V4L2_MEMORY_MMAP;
+        buf
+    };
+
+    // debug!("VIDIOC_DQBUF");
+    xioctl(
+        fd,
+        v4l::codes::VIDIOC_DQBUF,
+        &mut buf as *mut _ as *mut libc::c_void,
+    );
+
+    {
+        let mut fout = fs::File::create(&format!("out.ppm")).unwrap();
+        unsafe {
+            let data = slice::from_raw_parts(
+                buffers[buf.index as usize].start as *const u8,
+                buf.bytesused as usize,
+            );
+
+            let vdata = data.to_vec();
+
+            //#[derive(Debug)]
+            struct FpgaFrame {
+                sof: [u8; 2],
+                pkt_id: [u8; 4],
+                dtype: u8,
+                dlen: [u8; 2],
+                phl_id: [u8; 2],
+                reserved: u8,
+                data: Vec<u8>,
+                eof: [u8; 2],
+            }
+
+            impl fmt::Display for FpgaFrame {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    writeln!(f, "FpgaFrame {{")?;
+                    writeln!(f, "\tsof: {:X?}", self.sof)?;
+                    writeln!(f, "\tpkt_id: {:X?}", self.pkt_id)?;
+                    writeln!(f, "\tdtype: {:X?}", self.dtype)?;
+                    writeln!(f, "\tdlen: {:X?}", self.dlen)?;
+                    writeln!(f, "\tphl_id: {:X?}", self.phl_id)?;
+                    writeln!(f, "\treserved: {:X?}", self.reserved)?;
+                    writeln!(f, "\tdata: {:?}", std::str::from_utf8(&self.data))?;
+                    writeln!(f, "\teof: {:X?}", self.eof)?;
+                    writeln!(f, "}}")
+                }
+            }
+
+            let dlen = [vdata[7], vdata[8]];
+            #[allow(arithmetic_overflow)]
+            let dlen_size: usize = ((dlen[0] as usize) << 8) | dlen[1] as usize;
+            println!("dlen: {:#04X?}, dlen_size: {:#04X?}", dlen, dlen_size);
+            let mut temp = Vec::new();
+
+            temp.extend(&vdata[12..dlen_size]);
+
+            let frame = FpgaFrame {
+                sof: [vdata[0], vdata[1]],
+                pkt_id: [vdata[2], vdata[3], vdata[4], vdata[5]],
+                dtype: vdata[6],
+                dlen,
+                phl_id: [vdata[7], vdata[8]],
+                reserved: vdata[11],
+                data: temp,
+                eof: [
+                    vdata[dlen_size + 12 as usize],
+                    vdata[dlen_size + 13 as usize],
+                ],
+                /*
+                    sof: (vdata[0] << 8) + vdata[1],
+                    pkt_id: ((vdata[2] << 24) + (vdata[3] << 16) + (vdata[4] << 8) + vdata[5]),
+                    dtype: vdata[6],
+                    dlen: dlen,
+                    phl_id: (vdata[9] << 8) + vdata[10],
+                    reserved: vdata[11],
+                    data: &temp,
+                    eof: (vdata[i+1+12] << 8) + vdata[i+2+12],
+                */
+            };
+
+            println!("{}", frame);
+
+            //		println!("data: {:#?}", core::str::from_utf8_unchecked(data));
+            println!("data len: {:#?}", data.len());
+            fout.write_all(data).unwrap();
+        }
+    }
+
+    // debug!("VIDIOC_QBUF");
+    xioctl(
+        fd,
+        v4l::codes::VIDIOC_QBUF,
+        &mut buf as *mut _ as *mut libc::c_void,
+    );
+
     let mut type_ = v4l::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    debug!("VIDIOC_STREAMOFF");
+    // debug!("VIDIOC_STREAMOFF");
     xioctl(
         fd,
         v4l::codes::VIDIOC_STREAMOFF,
